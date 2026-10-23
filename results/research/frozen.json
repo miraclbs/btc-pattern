@@ -1,0 +1,16 @@
+[
+  {
+    "family": "long",
+    "lm": 2.0,
+    "k": 1.0,
+    "exit": "hedef 4R",
+    "filter": "filtre yok"
+  },
+  {
+    "family": "short",
+    "lm": 2.0,
+    "k": 1.0,
+    "exit": "1R'de başabaş + hedef 3R",
+    "filter": "sığ kırılım (<1x 4S mum)"
+  }
+]

@@ -1,0 +1,353 @@
+"""Web arayüzünün kullandığı hızlı arama motoru.
+
+matcher.py'deki yöntemin (sadece şekil, ayak izi yok) numba ile derlenmiş, çok çekirdekli hali.
+"Şu an" için yapı başlangıçlarını son tepe ve diplerden seçer; her başlangıç ayrı bir gruptur.
+
+Hız için iki aşamalı tarar: önce adaylar seyrek denenir (bkz. STRIDE_DIV), sonra en iyi 1000 adayın
+atlanan komşuları tek tek denenir. Pencere K=48 parçaya indirildiği için bir parçadan küçük kaydırma
+şekli pek değiştirmez. exact=True tam taramayı yapar.
+"""
+import time
+
+import numpy as np
+import pandas as pd
+from numba import njit, prange
+
+from matcher import load
+
+K = 48                              # her pencere bu kadar birleştirilmiş muma indirgenir
+SCALES = np.geomspace(0.4, 2.5, 13) # adayın sorguya göre uzunluk oranları
+W = np.array([0.5, 0.5, 1.0])       # [yüksek, düşük, kapanış]: fitillere yarım ağırlık
+BAND = 12                           # DTW: yapının bölümleri en fazla K'nın %25'i kadar kayabilir
+SIZE_TOL = 2.0                      # döneme göre boyu sorgunun 2 katından fazla farklı aday elenir
+# Ön tarama: m mumluk adaylar max(1, m // STRIDE_DIV) mum arayla denenir. Birebir yöntem kaymaya
+# DTW kadar toleranslı olmadığından daha sık taranır (25 grupta tam taramayla ortak: DTW 9,84/10,
+# birebir 9,96/10).
+STRIDE_DIV = {True: 8, False: 16}   # {DTW mi: bölen}
+REFINE_TOP = 3000                   # ön taramanın en iyi bu kadar adayının komşuları tek tek denenir
+                                    # (12 grupta ilk 50 olayın ort. 48,4'ü tam taramayla aynı)
+
+# "O dönemin normal mum boyu" kaç mumun ortalaması (zaman dilimine göre; 1s için 30 gün).
+AVG_WINDOW = {"15m": 2880, "1h": 720, "4h": 360, "1d": 120}
+INTERVALS = tuple(AVG_WINDOW)
+
+PIVOT_MULT = 4.0                    # fiyat, dönemin normal mumunun bu katı kadar dönünce tepe/dip onaylanır
+PIVOT_LOOKBACK = 1500               # tepe/dip ararken geriye bakılacak mum sayısı
+MIN_LEN, MAX_LEN = 24, 360          # otomatik gruplarda bir yapı en az / en fazla bu kadar mum olabilir
+MIN_SEL, MAX_SEL = 10, 600          # kullanıcının seçtiği alan en az / en fazla bu kadar mum olabilir
+MAX_GROUPS, TOP = 5, 50             # en fazla 5 başlangıç noktası, her birinde en benzer 50 olay
+MAIN_BARS = 1000                    # ana grafikte gösterilecek (ve seçim yapılabilecek) mum sayısı
+AFTER_MAX = 10                      # eşleşmenin sonrası en fazla yapı uzunluğunun bu katı kadar gösterilir
+CARD_BARS = 400                     # bir sonuç kartı için gönderilen en fazla mum (fazlası birleştirilir)
+DETAIL_BARS = 6000                  # karşılaştırma penceresi için gönderilen en fazla mum
+DETAIL_MIN_AFTER = 1000             # karşılaştırma penceresinde sonrası en az bu kadar mum (kısa yapılar için)
+CHUNK = 512                         # adaylar bu büyüklükte paketler halinde çekirdeklere dağıtılır
+
+
+@njit(cache=True)
+def _features(h, l, c, s, m, out):
+    """s'den başlayan m mumu K birleştirilmiş muma indirger: out[b] = [yüksek, düşük, kapanış]."""
+    k = out.shape[0]
+    for b in range(k):
+        lo = (b * m) // k
+        hi = max(((b + 1) * m) // k, lo + 1)
+        mx, mn = -np.inf, np.inf
+        for t in range(s + lo, s + hi):
+            mx = max(mx, h[t])
+            mn = min(mn, l[t])
+        out[b, 0], out[b, 1], out[b, 2] = mx, mn, c[s + hi - 1]
+
+
+@njit(cache=True)
+def _normalize(x, m, avg_range_at_end):
+    """x'i yerinde normalize eder (kapanışlar ortalama 0, std 1) ve yapının döneme göre boyunu döner."""
+    k = x.shape[0]
+    top, bottom, mean = -np.inf, np.inf, 0.0
+    for b in range(k):
+        top = max(top, x[b, 0])
+        bottom = min(bottom, x[b, 1])
+        mean += x[b, 2]
+    mean /= k
+    var = 0.0
+    for b in range(k):
+        var += (x[b, 2] - mean) ** 2
+    sd = np.sqrt(var / k) + 1e-12
+    for b in range(k):
+        for f in range(3):
+            x[b, f] = (x[b, f] - mean) / sd
+    return (top - bottom) / mean / (avg_range_at_end * np.sqrt(m))
+
+
+@njit(cache=True)
+def _euclid(q, x, w):
+    tot = 0.0
+    for i in range(q.shape[0]):
+        for f in range(3):
+            d = q[i, f] - x[i, f]
+            tot += w[f] * d * d
+    return tot / q.shape[0] / w.sum()
+
+
+@njit(cache=True)
+def _dtw(q, x, w, band, prev, cur):
+    """Bantlı DTW. prev/cur: k uzunlukta çalışma dizileri (her aday için yeniden ayrılmasın diye).
+
+    Ağırlık toplamına bölme sona bırakılır (sonuç aynı, hücre başına bir bölme eksik).
+    """
+    k = q.shape[0]
+    w0, w1, w2 = w[0], w[1], w[2]
+    # İlk satır: sadece soldan gelinebilir.
+    acc = 0.0
+    for j in range(min(k, band + 1)):
+        d0 = q[0, 0] - x[j, 0]; d1 = q[0, 1] - x[j, 1]; d2 = q[0, 2] - x[j, 2]
+        acc += w0 * d0 * d0 + w1 * d1 * d1 + w2 * d2 * d2
+        prev[j] = acc
+    if band + 1 < k:
+        prev[band + 1] = np.inf
+    for i in range(1, k):
+        j0, j1 = max(0, i - band), min(k, i + band + 1)
+        q0, q1, q2 = q[i, 0], q[i, 1], q[i, 2]
+        left = np.inf
+        for j in range(j0, j1):
+            d0 = q0 - x[j, 0]; d1 = q1 - x[j, 1]; d2 = q2 - x[j, 2]
+            best = prev[j]
+            if j > 0:
+                if prev[j - 1] < best:
+                    best = prev[j - 1]
+                if left < best:
+                    best = left
+            left = w0 * d0 * d0 + w1 * d1 * d1 + w2 * d2 * d2 + best
+            cur[j] = left
+        if j1 < k:
+            cur[j1] = np.inf                          # bir sonraki satır bandın sağ kenarını okur
+        prev, cur = cur, prev
+    return prev[k - 1] / k / (w0 + w1 + w2)
+
+
+@njit(parallel=True, cache=True)
+def _score(h, l, c, avg_range, starts, lengths, q, q_rel, w, band, use_dtw, size_tol, out):
+    """Her (başlangıç, uzunluk) adayının sorguya mesafesi. Boyu uymayan adaylar inf."""
+    k = q.shape[0]
+    n = len(starts)
+    for ci in prange((n + CHUNK - 1) // CHUNK):
+        x = np.empty((k, 3))
+        prev = np.empty(k)
+        cur = np.empty(k)
+        for i in range(ci * CHUNK, min(n, (ci + 1) * CHUNK)):
+            out[i] = np.inf
+            s, m = starts[i], lengths[i]
+            ar = avg_range[s + m - 1]
+            if ar > 0:                              # NaN (verinin ilk günleri) atlanır
+                _features(h, l, c, s, m, x)
+                ratio = _normalize(x, m, ar) / q_rel
+                if ratio > 1.0 / size_tol and ratio < size_tol:
+                    out[i] = _dtw(q, x, w, band, prev, cur) if use_dtw else _euclid(q, x, w)
+
+
+@njit(cache=True)
+def _distinct(order, start, length, limit):
+    """matcher.distinct_events ile aynı: en iyiden başlayarak seçer, zamanı çakışanları atlar."""
+    occupied = np.zeros((start + length).max() + 1, np.bool_)
+    picks = np.empty(limit, np.int64)
+    n = 0
+    for k in order:
+        s, m = start[k], length[k]
+        free = True
+        for t in range(s, s + m):
+            if occupied[t]:
+                free = False
+                break
+        if free:
+            occupied[s:s + m] = True
+            picks[n] = k
+            n += 1
+            if n == limit:
+                break
+    return picks[:n]
+
+
+def distinct_events(dist, start, length, limit: int = TOP) -> np.ndarray:
+    if len(dist) == 0:
+        return np.empty(0, np.int64)
+    return _distinct(np.argsort(dist), start, length, limit)
+
+
+class Engine:
+    def __init__(self, interval: str = "1h", symbol: str = "BTCUSDT"):
+        self.interval = interval
+        self.symbol = symbol
+        self.reload()
+        # Derleme ve iş parçacıklarının ilk açılışı kullanıcının ilk aramasına yansımasın diye.
+        n = len(self.t)
+        self.search(n - 100, n, True)
+        self.search(n - 100, n, False)
+
+    def reload(self):
+        df = load(self.interval, self.symbol)
+        self.t = (df.open_time.to_numpy() // 1000).astype(np.int64)
+        self.o, self.h, self.l, self.c = (np.ascontiguousarray(df[k].to_numpy(np.float64))
+                                          for k in ("open", "high", "low", "close"))
+        self.avg_range = (pd.Series((self.h - self.l) / self.c)
+                          .rolling(AVG_WINDOW[self.interval], min_periods=24).mean().to_numpy())
+        self.step = int(np.median(np.diff(self.t[-100:])))
+
+    def status(self) -> dict:
+        return {"interval": self.interval, "count": len(self.t),
+                "first": int(self.t[0]), "last": int(self.t[-1]) + self.step}
+
+    def pivots(self, now: int) -> list[tuple[int, str]]:
+        """now'dan önceki onaylanmış tepe ve dipler (zigzag). Gelecek veriye bakmaz."""
+        a = max(0, now - PIVOT_LOOKBACK)
+        h, l = self.h[a:now], self.l[a:now]
+        thr = PIVOT_MULT * self.avg_range[now - 1]
+        piv, direction, hi, lo = [], 0, 0, 0
+        for i in range(1, len(h)):
+            if direction >= 0 and h[i] >= h[hi]:
+                hi = i
+            if direction <= 0 and l[i] <= l[lo]:
+                lo = i
+            if direction == 0:
+                if lo < hi and h[hi] >= l[lo] * (1 + thr):
+                    piv.append((a + lo, "dip")); direction = 1
+                elif hi < lo and l[lo] <= h[hi] * (1 - thr):
+                    piv.append((a + hi, "tepe")); direction = -1
+            # Onay, uç noktadan sonraki bir mumla gelmeli: tek mumun içinde tepe mi dip mi önce
+            # oluştu bilinemez (yoksa büyük tek bir mum hem tepe hem dip sayılır).
+            elif direction == 1 and hi < i and l[i] <= h[hi] * (1 - thr):
+                piv.append((a + hi, "tepe")); direction = -1; lo = i
+            elif direction == -1 and lo < i and h[i] >= l[lo] * (1 + thr):
+                piv.append((a + lo, "dip")); direction = 1; hi = i
+        return piv
+
+    def groups(self, now: int, piv) -> list[dict]:
+        """Son tepe/diplerden başlayan, uzunluğu MIN_LEN..MAX_LEN olan yapılar (en yeniden eskiye)."""
+        out = []
+        for idx, kind in reversed(piv):
+            length = now - idx
+            if length < MIN_LEN:
+                continue
+            if length > MAX_LEN or len(out) == MAX_GROUPS:
+                break
+            out.append({"start_idx": idx, "length": length, "kind": kind})
+        return out
+
+    def _score(self, starts, lengths, q, q_rel, use_dtw):
+        out = np.empty(len(starts))
+        _score(self.h, self.l, self.c, self.avg_range, starts, lengths, q, q_rel,
+               W, BAND, use_dtw, SIZE_TOL, out)
+        return out
+
+    def search(self, q_start: int, q_end: int, use_dtw: bool, exact: bool = False,
+               end_limit: int | None = None):
+        """Sorgudan önce bitmiş adayları puanlar: (dist, start, length), elenenler hariç.
+
+        exact=True: her aday denenir (matcher.search ile aynı, foot=0).
+        Aksi halde iki aşamalı: seyrek ön tarama + en iyilerin komşuları.
+        end_limit: adaylar en geç bu indekste bitmeli (simülasyonda, adayın "sonrası" da karar
+        anından önce bitsin diye: end_limit = şu an - ufuk).
+        """
+        L = q_end - q_start
+        last_end = q_start if end_limit is None else min(q_start, end_limit)
+        q = np.empty((K, 3))
+        _features(self.h, self.l, self.c, q_start, L, q)
+        q_rel = _normalize(q, L, self.avg_range[q_end - 1])
+        coarse = not exact
+        div = STRIDE_DIV[use_dtw]
+
+        starts, lengths = [], []
+        for scale in SCALES:
+            m = int(round(L * scale))
+            n_starts = last_end - m + 1
+            if n_starts <= 0:
+                continue
+            st = np.arange(0, n_starts, max(1, m // div) if coarse else 1)
+            starts.append(st)
+            lengths.append(np.full(len(st), m))
+        if not starts:                              # sorgudan önce yeterli geçmiş yok
+            return np.empty(0), np.empty(0, np.int64), np.empty(0, np.int64)
+        s, m = np.concatenate(starts), np.concatenate(lengths)
+        d = self._score(s, m, q, q_rel, use_dtw)
+
+        if coarse:
+            # En iyi ön tarama adaylarının atlanan komşularını da dene.
+            ns, nm = [], []
+            for k in np.argsort(d)[:REFINE_TOP]:
+                step = max(1, m[k] // div)
+                if step == 1 or not np.isfinite(d[k]):
+                    continue
+                nb = np.arange(max(0, s[k] - step + 1), min(last_end - m[k], s[k] + step - 1) + 1)
+                nb = nb[nb != s[k]]
+                ns.append(nb)
+                nm.append(np.full(len(nb), m[k]))
+            if ns:
+                s2, m2 = np.concatenate(ns), np.concatenate(nm)
+                s, m = np.concatenate([s, s2]), np.concatenate([m, m2])
+                d = np.concatenate([d, self._score(s2, m2, q, q_rel, use_dtw)])
+
+        keep = np.isfinite(d)
+        return d[keep], s[keep], m[keep]
+
+    def _bars(self, a: int, b: int, factor: int, seg: int) -> list:
+        """[a, b) mumlarını factor'lük gruplar halinde birleştirir: [zaman, a, y, d, k, bölüm]."""
+        if b <= a:
+            return []
+        first = np.arange(a, b, factor)
+        last = np.minimum(first + factor, b) - 1
+        hi = np.maximum.reduceat(self.h[a:b], first - a)
+        lo = np.minimum.reduceat(self.l[a:b], first - a)
+        return [[t, o, h, l, c, seg] for t, o, h, l, c in zip(
+            self.t[first].tolist(), self.o[first].tolist(), hi.tolist(), lo.tolist(), self.c[last].tolist())]
+
+    def _window(self, s: int, m: int, now: int, pre: float, max_bars: int, min_after: int = 0) -> list:
+        """Eşleşmeyi öncesi (pre*m) ve sonrası (AFTER_MAX*m, en az min_after mum) ile döner;
+        'şu an'ın ötesine geçmez. max_bars'tan uzunsa mumlar birleştirilir."""
+        a, e = max(0, s - int(pre * m)), min(now, s + m + max(AFTER_MAX * m, min_after))
+        factor = max(1, -(-(e - a) // max_bars))
+        return (self._bars(a, s, factor, 0) + self._bars(s, s + m, factor, 1)
+                + self._bars(s + m, e, factor, 2))
+
+    def detail(self, start_ts: int, m: int, now_ts: int | None) -> list:
+        """Karşılaştırma penceresi için bir eşleşmenin ayrıntılı (birleştirilmemiş) mumları."""
+        now = len(self.t) if now_ts is None else int(np.searchsorted(self.t, now_ts))
+        s = int(np.searchsorted(self.t, start_ts))
+        if not 0 <= s < now or m <= 0:
+            raise ValueError("Geçersiz eşleşme")
+        return self._window(s, m, now, pre=1.0, max_bars=DETAIL_BARS, min_after=DETAIL_MIN_AFTER)
+
+    def find(self, now_ts: int | None, use_dtw: bool, sel: tuple[int, int] | None = None) -> dict:
+        """'Şu an' için arama. sel=(başlangıç, bitiş) verilirse otomatik gruplar yerine sadece
+        kullanıcının seçtiği [başlangıç, bitiş) aralığına benzeyen olaylar aranır."""
+        t0 = time.perf_counter()
+        now = len(self.t) if now_ts is None else int(np.searchsorted(self.t, now_ts))
+        now = max(MAX_LEN * 3, min(now, len(self.t)))
+        piv = self.pivots(now)
+        if sel:
+            a, b = (int(np.searchsorted(self.t, x)) for x in sel)
+            b = min(b, now)
+            if not MIN_SEL <= b - a <= MAX_SEL:
+                raise ValueError(f"Seçim {MIN_SEL}-{MAX_SEL} mum arasında olmalı (şu an {max(0, b - a)} mum).")
+            groups = [{"start_idx": a, "end_idx": b, "length": b - a, "kind": "secim"}]
+        else:
+            groups = [{**g, "end_idx": now} for g in self.groups(now, piv)]
+        for g in groups:
+            d, s, m = self.search(g["start_idx"], g["end_idx"], use_dtw)
+            picks = distinct_events(d, s, m)
+            # Benzerlik: kapanış şekilleri için korelasyona denk (%100 = birebir aynı şekil).
+            sim = np.clip(100 * (1 - d[picks] / 2), 0, 100)
+            g["start"] = int(self.t[g.pop("start_idx")])
+            g["end"] = int(self.t[g.pop("end_idx") - 1]) + self.step
+            g["results"] = [{"rank": r + 1, "start": int(self.t[s[k]]), "length": int(m[k]),
+                             "similarity": round(float(sim[r]), 1),
+                             "bars": self._window(int(s[k]), int(m[k]), now, pre=0.5, max_bars=CARD_BARS)}
+                            for r, k in enumerate(picks)]
+        a = max(0, now - MAIN_BARS)
+        return {
+            "interval": self.interval,
+            "now": int(self.t[now - 1]) + self.step,
+            "method": "dtw" if use_dtw else "euclid",
+            "main": self._bars(a, now, 1, 0),
+            "pivots": [[int(self.t[i]), kind, float(self.h[i] if kind == "tepe" else self.l[i])]
+                       for i, kind in piv if i >= a],
+            "groups": groups,
+            "elapsed": round(time.perf_counter() - t0, 2),
+        }

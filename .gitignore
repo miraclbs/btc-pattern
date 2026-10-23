@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.pyc
+
+# Binance mum verisi — fetch_data.py ile yeniden indirilir
+data/*.csv
