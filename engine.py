@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 from numba import njit, prange
 
+import context
 from matcher import load
 
 K = 48                              # her pencere bu kadar birleştirilmiş muma indirgenir
@@ -41,7 +42,30 @@ AFTER_MAX = 10                      # eşleşmenin sonrası en fazla yapı uzunl
 CARD_BARS = 400                     # bir sonuç kartı için gönderilen en fazla mum (fazlası birleştirilir)
 DETAIL_BARS = 6000                  # karşılaştırma penceresi için gönderilen en fazla mum
 DETAIL_MIN_AFTER = 1000             # karşılaştırma penceresinde sonrası en az bu kadar mum (kısa yapılar için)
+DETAIL_MIN_BEFORE = 1000            # karşılaştırma penceresinde öncesi en az bu kadar mum (seviyeler görünsün)
+
+# Destek/direnç: bir üst zaman diliminin zigzag tepe/dipleri (context.zigzag_levels), mumlar o zaman
+# dilimine çevrilerek hesaplanır. Bir yapı için sadece yapı bittiğinde onaylanmış olanlar gösterilir.
+LEVEL_SEC = {"15m": 4 * 3600, "1h": 4 * 3600, "4h": 86400, "1d": 7 * 86400}
+LEVEL_NAME = {"15m": "4S", "1h": "4S", "4h": "1G", "1d": "1H"}
+LEVEL_MULT = PIVOT_MULT             # dönüş eşiği: o zaman diliminin normal mum boyunun katı
+LEVEL_DAYS = {"15m": 60, "1h": 120, "4h": 365, "1d": 1500}    # bu kadar gün içinde oluşmuş seviyeler
+LEVEL_BAND = 0.5                    # yapının dışında, boyunun bu katı uzaklığa kadar olan seviyeler
+                                    # (15dk'da yapı başına ortalama 3, en çok ~8 seviye)
+
+# Üst zaman dilimi durumu (kartlardaki etiketler): trend (context.trend_labels: 50 mumluk ortalama ve eğimi)
+# ve son onaylı zigzag dönüşüne göre bacak yönü (son dönüş dipse yukarı bacak, tepeyse aşağı bacak).
+HTF = {"15m": [("4S", 4 * 3600), ("1G", 86400)], "1h": [("4S", 4 * 3600), ("1G", 86400)],
+       "4h": [("1G", 86400), ("1H", 7 * 86400)], "1d": [("1H", 7 * 86400)]}
+WEEK_ORIGIN = pd.Timestamp("1970-01-05")    # haftalık mumlar Pazartesi başlar (Binance gibi)
 CHUNK = 512                         # adaylar bu büyüklükte paketler halinde çekirdeklere dağıtılır
+
+# Bağlam: yapının içine değil, öncesine ve likiditeye bakar (şekil benzerliğinin görmediği kısım).
+CTX_PRE = 2                         # yapıdan önceki bu kat kadar mum incelenir
+POOL = 200                          # "şekil + bağlam" sıralamasında, şekle göre en iyi bu kadar olay yeniden sıralanır
+CTX_WEIGHT = 0.1                    # sıralama puanı = şekil mesafesi + CTX_WEIGHT x bağlam farkı
+# Yürüyen testte (analyze_rank.py, 15dk 2018-2023) hiçbir ağırlık 1 günlük tahmini şekle göre sıralamanın
+# üstüne çıkarmadı; arayüzde varsayılan "Şekil", bağlam göze yardımcı olarak duruyor.
 
 
 @njit(cache=True)
@@ -145,6 +169,50 @@ def _score(h, l, c, avg_range, starts, lengths, q, q_rel, w, band, use_dtw, size
 
 
 @njit(cache=True)
+def _context(h, l, c, starts, lengths, pre, out):
+    """Yapının bağlamı, yapının boyu (en yüksek - en düşük) cinsinden; önceki pre*m muma bakılır.
+
+    out[i, 0]: nereden geldi: o mumların net hareketi (- düşüşten, + yükselişten geldi)
+    out[i, 1]: üstteki likidite: o mumların en yükseği yapının tepesinin ne kadar üstünde (- ise yapı onu almış)
+    out[i, 2]: alttaki likidite: o mumların en düşüğü yapının dibinin ne kadar altında (- ise yapı onu almış)
+    Öncesinde yeterli veri olmayan yapılar NaN.
+    """
+    for i in range(len(starts)):
+        s, m = starts[i], lengths[i]
+        a = s - pre * m
+        if a < 0:
+            out[i, :] = np.nan
+            continue
+        hi, lo, ph, pl = -np.inf, np.inf, -np.inf, np.inf
+        for t in range(s, s + m):
+            hi = max(hi, h[t])
+            lo = min(lo, l[t])
+        for t in range(a, s):
+            ph = max(ph, h[t])
+            pl = min(pl, l[t])
+        r = hi - lo + 1e-12
+        out[i, 0] = (c[s - 1] - c[a]) / r
+        out[i, 1] = (ph - hi) / r
+        out[i, 2] = (lo - pl) / r
+
+
+def context_distance(q_ctx: np.ndarray, ctx: np.ndarray) -> np.ndarray:
+    """Bağlam farkı, 0 (aynı) - 4. Özellikler tanh ile sıkıştırılır: 0 ile 0,5 farkı önemli, 2 ile 3 farkı
+    değil. Öncesi bilinmeyen yapılar en uzak sayılır."""
+    dc = np.mean((np.tanh(ctx) - np.tanh(q_ctx)) ** 2, axis=-1)
+    return np.where(np.isnan(dc), 4.0, dc)
+
+
+def context_similarity(dc: np.ndarray) -> np.ndarray:
+    """Bağlam farkını yüzdeye çevirir (%100 = aynı bağlam)."""
+    return np.clip(100 * (1 - np.sqrt(dc) / 2), 0, 100)
+
+
+def _ctx_json(x: np.ndarray) -> list:
+    return [None if np.isnan(v) else round(float(v), 2) for v in x]
+
+
+@njit(cache=True)
 def _distinct(order, start, length, limit):
     """matcher.distinct_events ile aynı: en iyiden başlayarak seçer, zamanı çakışanları atlar."""
     occupied = np.zeros((start + length).max() + 1, np.bool_)
@@ -190,6 +258,57 @@ class Engine:
         self.avg_range = (pd.Series((self.h - self.l) / self.c)
                           .rolling(AVG_WINDOW[self.interval], min_periods=24).mean().to_numpy())
         self.step = int(np.median(np.diff(self.t[-100:])))
+        t, h, l, c = self._resample(LEVEL_SEC[self.interval])
+        lv = context.zigzag_levels(t, h, l, c, LEVEL_SEC[self.interval], LEVEL_MULT)
+        self.levels = (lv.price.to_numpy(), lv.kind.to_numpy(), lv.formed.to_numpy(np.int64),
+                       lv.confirmed.to_numpy(np.int64))
+        self.htf = []
+        for name, sec in HTF[self.interval]:
+            t, h, l, c = self._resample(sec)
+            piv = context.zigzag_levels(t, h, l, c, sec, PIVOT_MULT)
+            self.htf.append((name, t + sec, context.trend_labels(pd.Series(c)).to_numpy(),
+                             piv.confirmed.to_numpy(np.int64), piv.kind.to_numpy()))
+
+    def _resample(self, sec: int):
+        """Mumları sec saniyelik mumlara çevirir: (açılış zamanları, yüksek, düşük, kapanış). Son mum yarım olabilir;
+        kullananlar sadece kapanış zamanı (açılış + sec) geçmiş mumlara bakar."""
+        bars = (pd.DataFrame({"h": self.h, "l": self.l, "c": self.c}, index=pd.to_datetime(self.t, unit="s"))
+                .resample(f"{sec}s", origin=WEEK_ORIGIN if sec == 7 * 86400 else "epoch")
+                .agg({"h": "max", "l": "min", "c": "last"}).dropna())
+        return (bars.index.values.astype("datetime64[s]").astype(np.int64),
+                bars.h.to_numpy(), bars.l.to_numpy(), bars.c.to_numpy())
+
+    def htf_state(self, e: int) -> list:
+        """Yapı e. mumda bittiğinde üst zaman dilimlerinin durumu: [ad, trend, son bacağın yönü].
+        Sadece kapanmış mumlar ve onaylanmış dönüşler kullanılır."""
+        t_end = self.t[e - 1] + self.step
+        out = []
+        for name, closes, trend, confirmed, kind in self.htf:
+            k = int(np.searchsorted(closes, t_end, side="right")) - 1
+            p = int(np.searchsorted(confirmed, t_end, side="right")) - 1
+            tr = trend[k] if k >= 0 else None
+            out.append([name, tr if isinstance(tr, str) else None,      # ortalama oluşmadan önce NaN gelir
+                        None if p < 0 else ("yukarı" if kind[p] == "dip" else "aşağı")])
+        return out
+
+    def level_lines(self, s: int, e: int) -> list:
+        """[s, e) yapısı bittiğinde bilinen üst zaman dilimi tepe/dipleri (sonradan oluşanlar yok), yapının
+        çevresindekiler: [fiyat, tür, oluştuğu an, o zamana kadar kırılmış mı]."""
+        price, kind, formed, confirmed = self.levels
+        t_end = self.t[e - 1] + self.step
+        hi, lo = self.h[s:e].max(), self.l[s:e].min()
+        band = LEVEL_BAND * (hi - lo)
+        sel = np.flatnonzero((confirmed <= t_end) & (formed >= t_end - LEVEL_DAYS[self.interval] * 86400)
+                             & (price >= lo - band) & (price <= hi + band))
+        out = []
+        for i in sel:
+            a = int(np.searchsorted(self.t, confirmed[i]))
+            if kind[i] == "tepe":
+                broken = a < e and self.h[a:e].max() > price[i]
+            else:
+                broken = a < e and self.l[a:e].min() < price[i]
+            out.append([float(price[i]), str(kind[i]), int(formed[i]), bool(broken)])
+        return out
 
     def status(self) -> dict:
         return {"interval": self.interval, "count": len(self.t),
@@ -229,6 +348,13 @@ class Engine:
             if length > MAX_LEN or len(out) == MAX_GROUPS:
                 break
             out.append({"start_idx": idx, "length": length, "kind": kind})
+        return out
+
+    def context(self, starts, lengths) -> np.ndarray:
+        """Yapıların bağlam özellikleri (_context): (n, 3)."""
+        out = np.empty((len(starts), 3))
+        _context(self.h, self.l, self.c, np.asarray(starts, np.int64), np.asarray(lengths, np.int64),
+                 CTX_PRE, out)
         return out
 
     def _score(self, starts, lengths, q, q_rel, use_dtw):
@@ -298,10 +424,12 @@ class Engine:
         return [[t, o, h, l, c, seg] for t, o, h, l, c in zip(
             self.t[first].tolist(), self.o[first].tolist(), hi.tolist(), lo.tolist(), self.c[last].tolist())]
 
-    def _window(self, s: int, m: int, now: int, pre: float, max_bars: int, min_after: int = 0) -> list:
-        """Eşleşmeyi öncesi (pre*m) ve sonrası (AFTER_MAX*m, en az min_after mum) ile döner;
-        'şu an'ın ötesine geçmez. max_bars'tan uzunsa mumlar birleştirilir."""
-        a, e = max(0, s - int(pre * m)), min(now, s + m + max(AFTER_MAX * m, min_after))
+    def _window(self, s: int, m: int, now: int, pre: float, max_bars: int, min_after: int = 0,
+                min_before: int = 0) -> list:
+        """Eşleşmeyi öncesi (pre*m, en az min_before mum) ve sonrası (AFTER_MAX*m, en az min_after mum)
+        ile döner; 'şu an'ın ötesine geçmez. max_bars'tan uzunsa mumlar birleştirilir."""
+        a = max(0, s - max(int(pre * m), min_before))
+        e = min(now, s + m + max(AFTER_MAX * m, min_after))
         factor = max(1, -(-(e - a) // max_bars))
         return (self._bars(a, s, factor, 0) + self._bars(s, s + m, factor, 1)
                 + self._bars(s + m, e, factor, 2))
@@ -312,11 +440,14 @@ class Engine:
         s = int(np.searchsorted(self.t, start_ts))
         if not 0 <= s < now or m <= 0:
             raise ValueError("Geçersiz eşleşme")
-        return self._window(s, m, now, pre=1.0, max_bars=DETAIL_BARS, min_after=DETAIL_MIN_AFTER)
+        return self._window(s, m, now, pre=1.0, max_bars=DETAIL_BARS, min_after=DETAIL_MIN_AFTER,
+                            min_before=DETAIL_MIN_BEFORE)
 
-    def find(self, now_ts: int | None, use_dtw: bool, sel: tuple[int, int] | None = None) -> dict:
+    def find(self, now_ts: int | None, use_dtw: bool, sel: tuple[int, int] | None = None,
+             by_context: bool = False) -> dict:
         """'Şu an' için arama. sel=(başlangıç, bitiş) verilirse otomatik gruplar yerine sadece
-        kullanıcının seçtiği [başlangıç, bitiş) aralığına benzeyen olaylar aranır."""
+        kullanıcının seçtiği [başlangıç, bitiş) aralığına benzeyen olaylar aranır.
+        by_context: şekle göre en iyi POOL olay, şekil + bağlam puanıyla yeniden sıralanır."""
         t0 = time.perf_counter()
         now = len(self.t) if now_ts is None else int(np.searchsorted(self.t, now_ts))
         now = max(MAX_LEN * 3, min(now, len(self.t)))
@@ -331,13 +462,26 @@ class Engine:
             groups = [{**g, "end_idx": now} for g in self.groups(now, piv)]
         for g in groups:
             d, s, m = self.search(g["start_idx"], g["end_idx"], use_dtw)
-            picks = distinct_events(d, s, m)
+            pool = distinct_events(d, s, m, POOL)           # şekle göre sıralı
+            q_ctx = self.context([g["start_idx"]], [g["length"]])[0]
+            ctx = self.context(s[pool], m[pool])
+            dc = context_distance(q_ctx, ctx)
+            order = np.argsort(d[pool] + CTX_WEIGHT * dc, kind="stable") if by_context else np.arange(len(pool))
+            order = order[:TOP]
+            picks = pool[order]
             # Benzerlik: kapanış şekilleri için korelasyona denk (%100 = birebir aynı şekil).
             sim = np.clip(100 * (1 - d[picks] / 2), 0, 100)
+            ctx_sim = context_similarity(dc[order])
+            g["levels"] = self.level_lines(g["start_idx"], g["end_idx"])
+            g["htf"] = self.htf_state(g["end_idx"])
             g["start"] = int(self.t[g.pop("start_idx")])
             g["end"] = int(self.t[g.pop("end_idx") - 1]) + self.step
+            g["context"] = _ctx_json(q_ctx)
             g["results"] = [{"rank": r + 1, "start": int(self.t[s[k]]), "length": int(m[k]),
                              "similarity": round(float(sim[r]), 1),
+                             "context": round(float(ctx_sim[r])), "ctx": _ctx_json(ctx[order[r]]),
+                             "levels": self.level_lines(int(s[k]), int(s[k] + m[k])),
+                             "htf": self.htf_state(int(s[k] + m[k])),
                              "bars": self._window(int(s[k]), int(m[k]), now, pre=0.5, max_bars=CARD_BARS)}
                             for r, k in enumerate(picks)]
         a = max(0, now - MAIN_BARS)
@@ -345,6 +489,8 @@ class Engine:
             "interval": self.interval,
             "now": int(self.t[now - 1]) + self.step,
             "method": "dtw" if use_dtw else "euclid",
+            "rank": "context" if by_context else "shape",
+            "level_tf": LEVEL_NAME[self.interval],
             "main": self._bars(a, now, 1, 0),
             "pivots": [[int(self.t[i]), kind, float(self.h[i] if kind == "tepe" else self.l[i])]
                        for i, kind in piv if i >= a],

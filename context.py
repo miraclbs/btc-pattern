@@ -20,7 +20,7 @@ LEVEL_DAYS = 90        # seviye olarak son kaç günün tepe/diplerine bakılır
 NEAR = 0.5             # seviyeye "yakın": günlük normal mum boyunun bu katından yakın
 
 
-def _trend(c: pd.Series, n: int = 50, slope_lag: int = 10) -> pd.Series:
+def trend_labels(c: pd.Series, n: int = 50, slope_lag: int = 10) -> pd.Series:
     sma = c.rolling(n).mean()
     rising = sma > sma.shift(slope_lag)
     out = np.where((c > sma) & rising, "yukarı", np.where((c < sma) & ~rising, "aşağı", "yatay"))
@@ -31,7 +31,7 @@ def daily_features(symbol: str = "BTCUSDT") -> pd.DataFrame:
     d = load("1d", symbol)
     c = d.close
     f = pd.DataFrame({"avail": d.open_time // 1000 + 86400})          # mum kapanınca kullanılabilir
-    f["g_trend"] = _trend(c)
+    f["g_trend"] = trend_labels(c)
     sma200 = c.rolling(200).mean()
     f["sezon"] = np.where(sma200.isna(), None, np.where(c > sma200, "boğa", "ayı"))
     lo, hi = d.low.rolling(90).min(), d.high.rolling(90).max()
@@ -45,16 +45,21 @@ def daily_features(symbol: str = "BTCUSDT") -> pd.DataFrame:
 
 def h4_features(symbol: str = "BTCUSDT") -> pd.DataFrame:
     d = load("4h", symbol)
-    return pd.DataFrame({"avail": d.open_time // 1000 + 4 * 3600, "s4_trend": _trend(d.close)})
+    return pd.DataFrame({"avail": d.open_time // 1000 + 4 * 3600, "s4_trend": trend_labels(d.close)})
 
 
 def h4_levels(mult: float = PIVOT_MULT, symbol: str = "BTCUSDT") -> pd.DataFrame:
     """4S zigzag tepe/dipleri: (seviye fiyatı, tür, oluştuğu an, onaylandığı an). Onaydan önce bilinmez.
     mult: dönüş eşiği, 4S normal mum boyunun katı (küçüldükçe daha çok, daha küçük seviye)."""
     d = load("4h", symbol)
-    t = (d.open_time // 1000).to_numpy()
-    h, l = d.high.to_numpy(), d.low.to_numpy()
-    avg = pd.Series((h - l) / d.close).rolling(180, min_periods=24).mean().to_numpy()
+    return zigzag_levels((d.open_time // 1000).to_numpy(), d.high.to_numpy(), d.low.to_numpy(),
+                         d.close.to_numpy(), 4 * 3600, mult)
+
+
+def zigzag_levels(t, h, l, c, bar_sec: int, mult: float) -> pd.DataFrame:
+    """Herhangi bir zaman diliminin zigzag tepe/dipleri (h4_levels ile aynı kural). Normal mum boyu son
+    30 günün (en az 24 mumun) ortalaması; onay, dönüşü gösteren mum kapanınca (t + bar_sec) bilinir."""
+    avg = pd.Series((h - l) / c).rolling(max(24, 30 * 86400 // bar_sec), min_periods=24).mean().to_numpy()
     rows, direction, hi, lo = [], 0, 0, 0
     for i in range(1, len(h)):
         if not avg[i] > 0:
@@ -65,7 +70,7 @@ def h4_levels(mult: float = PIVOT_MULT, symbol: str = "BTCUSDT") -> pd.DataFrame
             hi = i
         if direction <= 0 and l[i] <= l[lo]:
             lo = i
-        confirm = t[i] + 4 * 3600                     # onay, i. mum kapanınca bilinir
+        confirm = t[i] + bar_sec                      # onay, i. mum kapanınca bilinir
         if direction == 0:
             if lo < hi and h[hi] >= l[lo] * (1 + thr):
                 rows.append((l[lo], "dip", t[lo], confirm)); direction = 1

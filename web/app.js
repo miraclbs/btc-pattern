@@ -28,6 +28,7 @@ const fmtDay = new Intl.DateTimeFormat('tr-TR', { day: 'numeric', month: 'short'
 const fmtHour = new Intl.DateTimeFormat('tr-TR', { hour: '2-digit', minute: '2-digit' });
 const fmtShort = new Intl.DateTimeFormat('tr-TR', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
 const fmtShortDay = new Intl.DateTimeFormat('tr-TR', { day: 'numeric', month: 'short', year: 'numeric' });
+const fmtDayMonth = new Intl.DateTimeFormat('tr-TR', { day: 'numeric', month: 'short' });
 const daily = () => state.tf === '1d';
 const day = (t) => fmtDay.format(new Date(t * 1000));
 const hour = (t) => fmtHour.format(new Date(t * 1000));
@@ -35,6 +36,39 @@ const short = (t) => (daily() ? fmtShortDay : fmtShort).format(new Date(t * 1000
 const when = (t) => (daily() ? day(t) : `${day(t)} ${hour(t)}`);
 const num = (x, d = 1) => x.toLocaleString('tr-TR', { minimumFractionDigits: d, maximumFractionDigits: d });
 const kindText = (g) => ({ tepe: 'Tepeden', dip: 'Dipten', secim: 'Seçim' })[g.kind];
+/** Benzerlik yüzdesine göre renk tonu: lo ve altı kırmızı, lo + span ve üstü yeşil. */
+const hueOf = (v, lo, span) => Math.round(30 + 115 * Math.max(0, Math.min(1, (v - lo) / span)));
+
+/** Bağlam (engine._context, yapının boyu cinsinden): [nereden geldi, üstteki likidite, alttaki likidite]. */
+function ctxText(c) {
+  if (!c || c.includes(null)) return '';
+  const side = (v, name) => (v >= 0 ? `${name} ${num(v)}×` : `${name} alınmış`);
+  return `önce ${c[0] < 0 ? '↓' : '↑'}${num(Math.abs(c[0]))}× · ${side(c[1], 'üstte')} · ${side(c[2], 'altta')}`;
+}
+/** Üst zaman dilimi durumu (engine.htf_state): [ad, trend, son bacak]. Örn. "4S ↑ düzeltme". */
+function htfText([name, trend, leg]) {
+  if (!trend || !leg) return `${name} ?`;
+  const arrow = { yukarı: '↑', aşağı: '↓', yatay: '→' }[trend];
+  const phase = trend === 'yatay' ? (leg === 'yukarı' ? 'yükselen bacak' : 'düşen bacak')
+    : (trend === leg ? 'trend yönünde' : 'düzeltme');
+  return `${name} ${arrow} ${phase}`;
+}
+function htfTitle([name, trend, leg]) {
+  if (!trend || !leg) return `${name}: yeterli geçmiş yok`;
+  const word = { yukarı: 'yükseliş', aşağı: 'düşüş', yatay: 'yatay' }[trend];
+  return `${name}: ${trend === 'yatay' ? 'trend yok (yatay)' : `${word} trendi`}, `
+    + `son dönüşten beri fiyat ${leg === 'yukarı' ? 'yükseliyor' : 'düşüyor'}`;
+}
+/** Etiket kutucukları; ref verilirse (seçili yapının durumu) aynı olanlar vurgulanır. */
+function htfChips(list, ref, cls = '') {
+  return (list || []).map((x, i) => {
+    const same = ref && ref[i] && x[1] === ref[i][1] && x[2] === ref[i][2];
+    return `<span class="${cls}${same ? ' same' : ''}" title="${htfTitle(x)}">${htfText(x)}</span>`;
+  }).join('');
+}
+const CTX_HELP ='Önce: yapıdan önceki 2 kat uzunlukta fiyat ne kadar düşmüş (↓) ya da yükselmiş (↑). '
+  + 'Üstte / altta: o dönemin en yüksek / en düşük noktası yapının tepesinin / dibinin ne kadar ötesinde '
+  + '(alınmamış likidite); "alınmış": yapı o seviyeyi geçmiş. Hepsi yapının boyu cinsinden.';
 /** n mumun kabaca ne kadar zaman ettiği: "~11 gün", "~18 saat". */
 function span(n) {
   const hours = (n * TF[state.tf].sec) / 3600;
@@ -47,7 +81,8 @@ function loadPrefs() {
 function savePrefs() {
   try {
     localStorage.setItem('btc-pattern', JSON.stringify({
-      tf: state.tf, mode: state.mode, method: state.method, after: state.after, count: state.count,
+      tf: state.tf, mode: state.mode, method: state.method, rank: state.rank, after: state.after, count: state.count,
+      levels: state.levels,
       now: $('#nowInput').value,
     }));
   } catch { /* gizli pencere vb. */ }
@@ -58,8 +93,12 @@ const state = {
   tf: TF[prefs.tf] ? prefs.tf : '1h',
   mode: prefs.mode || 'live',
   method: prefs.method || 'dtw',
+  rank: prefs.rank === 'context' ? 'context' : 'shape',
   after: AFTER_OPTIONS.includes(prefs.after) ? prefs.after : (prefs.after === false ? 0 : 3),
   count: COUNT_OPTIONS.includes(prefs.count) ? prefs.count : 50,
+  levels: prefs.levels !== false,   // karşılaştırmada üst zaman dilimi tepe/dipleri
+  drawing: false,                   // karşılaştırmada tıklayınca yatay çizgi
+
   status: null,
   data: null,
   group: 0,
@@ -73,6 +112,7 @@ let gridCharts = [];
 let modalCharts = [];
 let drag = null;
 const detailCache = new Map();   // karşılaştırma penceresi için çekilen ayrıntılı mumlar
+const userLines = new Map();     // kullanıcının çizdiği yatay çizgiler: grafik anahtarı -> fiyatlar
 
 /* ---------- Grafik yardımcıları ---------- */
 
@@ -143,6 +183,49 @@ function drawCandles(chart, bars, { maxBars = 0 } = {}) {
   return series;
 }
 
+/** Üst zaman dilimi tepe/dipleri: oluştuğu andan (ya da grafiğin başından) sona kadar kesikli çizgi.
+ *  levels: [fiyat, tür, oluştuğu an, kırılmış mı]. Ölçeği etkilemez. */
+function drawLevels(chart, bars, levels, tf) {
+  if (!state.levels || !levels || !bars.length) return;
+  const last = bars[bars.length - 1][0];
+  levels.forEach(([price, kind, formed, broken]) => {
+    // Çizgi, grafikteki bir mumdan başlasın (birleştirilmiş mumlarda boşluk açılmasın).
+    const start = (bars.find((b) => b[0] >= formed) || bars[bars.length - 1])[0];
+    const alpha = broken ? 0.4 : 0.85;
+    const line = chart.addLineSeries({
+      color: kind === 'tepe' ? `rgba(249,168,212,${alpha})` : `rgba(134,239,172,${alpha})`,
+      lineWidth: 1, lineStyle: broken ? LC.LineStyle.Dotted : LC.LineStyle.Dashed,
+      priceLineVisible: false, lastValueVisible: true, crosshairMarkerVisible: false,
+      title: `${tf} ${kind} ${fmtDayMonth.format(new Date(formed * 1000))}`,
+      autoscaleInfoProvider: () => null,
+    });
+    line.setData(start === last ? [{ time: local(last), value: price }]
+      : [{ time: local(start), value: price }, { time: local(last), value: price }]);
+  });
+}
+
+/** Çizim açıkken tıklanan fiyata yatay çizgi ekler; var olan çizginin üstüne tıklanırsa siler. */
+function bindDrawing(chart, series, key) {
+  const lines = new Map();   // fiyat -> IPriceLine
+  const add = (p) => lines.set(p, series.createPriceLine({
+    price: p, color: C.accent, lineWidth: 1, lineStyle: LC.LineStyle.Solid, axisLabelVisible: true, title: '',
+  }));
+  (userLines.get(key) || []).forEach(add);
+  chart.subscribeClick((param) => {
+    if (!state.drawing || !param.point) return;
+    const y = param.point.y;
+    const hit = [...lines.keys()].find((p) => Math.abs(series.priceToCoordinate(p) - y) < 6);
+    if (hit !== undefined) {
+      series.removePriceLine(lines.get(hit));
+      lines.delete(hit);
+    } else {
+      const p = series.coordinateToPrice(y);
+      if (p !== null) add(Math.round(p));
+    }
+    userLines.set(key, [...lines.keys()]);
+  });
+}
+
 function dispose(list) {
   list.forEach((c) => c.remove());
   return [];
@@ -158,7 +241,8 @@ function render({ keepView = false } = {}) {
   const d = state.data;
   $('#nowLabel').textContent = `${state.mode === 'live' ? 'Canlı' : 'Geçmiş tarih'} · ${TF[d.interval].name}`
     + ` · şu an ${when(d.now)}`;
-  $('#elapsed').textContent = `${num(d.elapsed)} sn · ${d.method === 'dtw' ? 'DTW' : 'Birebir'}`;
+  $('#elapsed').textContent = `${num(d.elapsed)} sn · ${d.method === 'dtw' ? 'DTW' : 'Birebir'}`
+    + (d.rank === 'context' ? ' + bağlam' : '');
   renderGroups();
   renderMain({ keepView });
   renderGrid();
@@ -226,11 +310,14 @@ function renderGrid() {
   grid.innerHTML = '';
   const g = state.data.groups[state.group];
   if (!g) {
+    $('#queryHtf').innerHTML = '';
     $('#groupTitle').textContent = 'Sonuç yok';
     grid.innerHTML = '<div class="empty">Bu an için uygun bir tepe/dip bulunamadı. Başka bir tarih dene ya da grafikte bir alan seç.</div>';
     return;
   }
   const results = shownResults();
+  $('#queryHtf').innerHTML = `<b>${g.kind === 'secim' ? 'Seçtiğin yapı' : 'Şu anki yapı'}:</b>${htfChips(g.htf, null, 'query')}`
+    + '<small>Kartlarda seninkiyle aynı olan durum yeşil</small>';
   $('#groupTitle').textContent = g.kind === 'secim'
     ? `Seçtiğin ${g.length} mumluk yapıya en benzer ${results.length} olay`
     : `${kindText(g)} başlayan ${g.length} mumluk yapıya en benzer ${results.length} olay`;
@@ -257,11 +344,14 @@ function renderGrid() {
     if (i < 10) card.style.animationDelay = `${i * 25}ms`;
     else card.style.animation = 'none';     // uzun listede beliriş animasyonu sadece ilk satırlarda
     card.title = `Bu yapı, seçili yapının ${num(r.length / g.length)} katı sürede oluşmuş`;
-    const hue = Math.round(30 + 115 * Math.max(0, Math.min(1, (r.similarity - 85) / 13)));
     const sub = daily() ? `${r.length} mum` : `${hour(r.start)} · ${r.length} mum`;
+    const ctx = ctxText(r.ctx);
     card.innerHTML = `<header><span class="rank">${r.rank}</span>`
       + `<div class="when"><b>${day(r.start)}</b><small>${sub}</small></div>`
-      + `<span class="sim" style="--h:${hue}">%${num(r.similarity)}</span></header><div class="mini"></div>`;
+      + `<div class="scores"><span class="sim" style="--h:${hueOf(r.similarity, 85, 13)}" title="Şekil benzerliği">%${num(r.similarity)}</span>`
+      + `<small class="ctx" style="--h:${hueOf(r.context, 40, 50)}" title="${ctx ? `Bu olay: ${ctx}\n\n${CTX_HELP}` : CTX_HELP}">`
+      + `bağlam %${r.context}</small></div></header>`
+      + `<div class="htf">${htfChips(r.htf, g.htf)}</div><div class="mini"></div>`;
     card.onclick = () => openModal(i);
     card.onkeydown = (e) => {
       if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.stopPropagation(); openModal(i); }
@@ -371,8 +461,22 @@ function openModal(i) {
   renderModal();
 }
 
+function setDrawing(on) {
+  state.drawing = on;
+  $('#drawBtn').classList.toggle('on', on);
+  $('#modal').classList.toggle('drawing', on);
+}
+
+function toggleLevels() {
+  state.levels = !state.levels;
+  $('#levelsBtn').classList.toggle('on', state.levels);
+  savePrefs();
+  if (state.modal >= 0) renderModal();
+}
+
 function closeModal() {
   state.modal = -1;
+  setDrawing(false);
   modalToken++;
   $('#modal').hidden = true;
   modalCharts = dispose(modalCharts);
@@ -403,14 +507,25 @@ async function renderModal() {
       + ' daha ilerisi için grafiği sağa kaydır' : '');
   $('#modalQueryLabel').textContent = g.kind === 'secim' ? `Seçtiğin yapı · ${day(g.start)}` : 'Şu an';
   $('#modalPastLabel').textContent = `Geçmiş · ${day(r.start)}`;
+  $('#modalQueryHtf').innerHTML = htfChips(g.htf, null, 'query');
+  $('#modalPastHtf').innerHTML = htfChips(r.htf, g.htf);
+  $('#modalQueryCtx').textContent = ctxText(g.context);
+  $('#modalPastCtx').textContent = ctxText(r.ctx) && `${ctxText(r.ctx)} · bağlam uyumu %${r.context}`;
+  $('#modalQueryCtx').title = $('#modalPastCtx').title = CTX_HELP;
 
-  // Seçim "şu an"dan önce bitiyorsa, sonrasında ne olduğu da (soluk) gösterilir.
+  // Seçim "şu an"dan önce bitiyorsa, sonrasında ne olduğu da (soluk) gösterilir. Öncesi ana grafikteki
+  // kadardır (seviyelere bakmak için sola kaydırılabilir); ilk görünüm yapının yarısı kadar öncesinden.
   const from = g.start - Math.floor(g.length / 2) * sec;
   const to = g.end + state.after * g.length * sec;
-  const qBars = d.main.filter((b) => b[0] >= from && b[0] < to)
+  const qBars = d.main.filter((b) => b[0] < to)
     .map((b) => [b[0], b[1], b[2], b[3], b[4], segOf(b[0], g)]);
   const q = makeChart($('#modalQuery'), { axes: true, interactive: true });
-  drawCandles(q, qBars);
+  const qSeries = drawCandles(q, qBars);
+  drawLevels(q, qBars, g.levels, d.level_tf);
+  bindDrawing(q, qSeries, `q:${d.interval}:${g.start}:${g.end}`);
+  q.timeScale().setVisibleLogicalRange({
+    from: Math.max(0, qBars.findIndex((b) => b[0] >= from)), to: qBars.length + 1,
+  });
   modalCharts = [q];
 
   // Geçmiş eşleşme: ayrıntılı mumlar sunucudan (sonrası 10 katına kadar, birleştirilmeden).
@@ -433,7 +548,9 @@ async function renderModal() {
   el.textContent = '';
   const rows = state.after ? bars : bars.filter((b) => b[5] !== 2);
   const m = makeChart(el, { axes: true, interactive: true });
-  drawCandles(m, rows);
+  const mSeries = drawCandles(m, rows);
+  drawLevels(m, rows, r.levels, d.level_tf);
+  bindDrawing(m, mSeries, `m:${d.interval}:${r.start}:${r.length}`);
   // İlk görünüm: yapının yarısı kadar öncesi + yapı + seçilen kat kadar sonrası. Gerisi sağda.
   const vFrom = r.start - Math.floor(r.length / 2) * sec;
   const vTo = r.start + (1 + state.after) * r.length * sec;
@@ -480,7 +597,7 @@ function toast(msg, kind = '') {
 
 async function runSearch({ keepView = false } = {}) {
   if (state.busy) return;
-  const params = new URLSearchParams({ interval: state.tf, method: state.method });
+  const params = new URLSearchParams({ interval: state.tf, method: state.method, rank: state.rank });
   if (state.mode === 'past') {
     const v = $('#nowInput').value;
     if (!v) { toast('Önce bir tarih seç.', 'error'); return; }
@@ -590,6 +707,15 @@ function bind() {
       if (state.data) runSearch({ keepView: true });
     };
   });
+  document.querySelectorAll('#rankSeg button').forEach((b) => {
+    b.onclick = () => {
+      if (state.rank === b.dataset.v) return;
+      state.rank = b.dataset.v;
+      setSeg('#rankSeg', state.rank);
+      savePrefs();
+      if (state.data) runSearch({ keepView: true });
+    };
+  });
   document.querySelectorAll('.after-seg button').forEach((b) => {
     b.onclick = () => setAfter(Number(b.dataset.v));
   });
@@ -601,6 +727,8 @@ function bind() {
   $('#searchBtn').onclick = () => runSearch();
   $('#selectBtn').onclick = () => (state.selecting ? stopSelecting() : startSelecting());
   $('#closeBtn').onclick = closeModal;
+  $('#levelsBtn').onclick = toggleLevels;
+  $('#drawBtn').onclick = () => setDrawing(!state.drawing);
   $('#prevBtn').onclick = () => stepModal(-1);
   $('#nextBtn').onclick = () => stepModal(1);
   $('#modal').onclick = (e) => { if (e.target.id === 'modal') closeModal(); };
@@ -611,6 +739,7 @@ function bind() {
       if (e.key === 'Escape') closeModal();
       else if (e.key === 'ArrowLeft') stepModal(-1);
       else if (e.key === 'ArrowRight') stepModal(1);
+      else if (e.key === 'd' || e.key === 'D') setDrawing(!state.drawing);
       return;
     }
     if (e.target.matches('input, textarea')) return;
@@ -626,6 +755,8 @@ async function init() {
   setSeg('#tfSeg', state.tf);
   $('#tfChip').textContent = `BTC/USDT · ${TF[state.tf].chip}`;
   setSeg('#methodSeg', state.method);
+  setSeg('#rankSeg', state.rank);
+  $('#levelsBtn').classList.toggle('on', state.levels);
   setSeg('#afterSeg', String(state.after));
   setSeg('#countSeg', String(state.count));
   if (prefs.now) $('#nowInput').value = prefs.now;

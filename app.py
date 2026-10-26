@@ -58,16 +58,19 @@ def update(interval: str = "1h"):
 
 @app.get("/api/search")
 def search(interval: str = "1h", method: str = "dtw", now: int | None = None,
-           start: int | None = None, end: int | None = None):
-    """now: 'şu an' (unix saniye, boşsa son mum). start/end: kullanıcının seçtiği aralık."""
+           start: int | None = None, end: int | None = None, rank: str = "shape"):
+    """now: 'şu an' (unix saniye, boşsa son mum). start/end: kullanıcının seçtiği aralık.
+    rank: 'shape' şekle göre, 'context' şekil + bağlama göre sıralar."""
     if method not in ("dtw", "euclid"):
         raise HTTPException(400, "method 'dtw' ya da 'euclid' olmalı")
+    if rank not in ("shape", "context"):
+        raise HTTPException(400, "rank 'shape' ya da 'context' olmalı")
     if (start is None) != (end is None):
         raise HTTPException(400, "Seçim için start ve end birlikte verilmeli")
     with lock:
         try:
             return json_response(get_engine(interval).find(
-                now, method == "dtw", (start, end) if start is not None else None))
+                now, method == "dtw", (start, end) if start is not None else None, rank == "context"))
         except ValueError as e:
             raise HTTPException(400, str(e))
 
@@ -82,7 +85,17 @@ def detail(start: int, length: int, interval: str = "1h", now: int | None = None
             raise HTTPException(400, str(e))
 
 
-app.mount("/", StaticFiles(directory=Path(__file__).parent / "web", html=True), name="web")
+class NoCacheStaticFiles(StaticFiles):
+    """Tarayıcı dosyaları her açılışta sunucuya sorsun (değişmediyse 304 döner): güncellemeden sonra
+    önbellekteki eski app.js ile çalışılmasın."""
+
+    async def get_response(self, path, scope):
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
+app.mount("/", NoCacheStaticFiles(directory=Path(__file__).parent / "web", html=True), name="web")
 
 if __name__ == "__main__":
     get_engine("1h")      # varsayılan zaman dilimi açılışta hazır olsun

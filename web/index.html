@@ -33,6 +33,10 @@
         <button data-v="dtw" class="on" title="Yapının bölümleri farklı hızda oluşmuş olsa da eşleştirir">DTW</button>
         <button data-v="euclid" title="Mumları sırayla, birebir karşılaştırır">Birebir</button>
       </div>
+      <div class="seg" id="rankSeg" role="tablist" aria-label="Sıralama">
+        <button data-v="shape" class="on" title="Sadece yapının şekline göre sıralar">Şekil</button>
+        <button data-v="context" title="Şekle göre en iyi 200 olayı, yapının öncesi ve likiditesi de benzeyecek şekilde yeniden sıralar. Yürüyen testte tahmini iyileştirmedi; göze daha tutarlı örnekler göstermek için">Şekil + bağlam</button>
+      </div>
       <div class="seg-labeled" title="Eşleşmeden sonra ne kadarı gösterilsin (yapı uzunluğunun katı)">
         <span>Sonrası</span>
         <div class="seg after-seg" id="afterSeg">
@@ -80,6 +84,7 @@
         <div>
           <h2 id="groupTitle">En benzer olaylar</h2>
           <p class="sub" id="groupSub">Vurgulu alan eşleşen yapı, sağındaki kısım sonrasında olanlar. Karta tıklayınca büyük karşılaştırma açılır.</p>
+          <div class="htf htf-query" id="queryHtf"></div>
         </div>
         <div class="seg-labeled" title="Kaç benzer olay gösterilsin">
           <span>Sonuç</span>
@@ -96,7 +101,7 @@
 
   <footer>
     Grafikler: <a href="https://www.tradingview.com/" target="_blank" rel="noopener">TradingView Lightweight Charts™</a>
-    · Kısayollar: <kbd>S</kbd> alan seç, <kbd>1</kbd>–<kbd>5</kbd> grup, <kbd>Enter</kbd> ara, <kbd>←</kbd><kbd>→</kbd> karşılaştırmada gezin
+    · Kısayollar: <kbd>S</kbd> alan seç, <kbd>1</kbd>–<kbd>5</kbd> grup, <kbd>Enter</kbd> ara, <kbd>←</kbd><kbd>→</kbd> karşılaştırmada gezin, <kbd>D</kbd> karşılaştırmada çizgi
   </footer>
 
   <div class="modal" id="modal" hidden>
@@ -117,6 +122,8 @@
               <button data-v="10">10×</button>
             </div>
           </div>
+          <button class="ghost on" id="levelsBtn" title="Bir üst zaman diliminin tepe/dipleri; sadece yapı bittiğinde bilinenler. Noktalı: o zamana kadar kırılmış">Seviyeler</button>
+          <button class="ghost" id="drawBtn" title="Açıkken grafiğe tıklayınca yatay çizgi eklenir, çizginin üstüne tıklayınca silinir (D)">Çizgi</button>
           <button class="icon" id="prevBtn" aria-label="Önceki">‹</button>
           <button class="icon" id="nextBtn" aria-label="Sonraki">›</button>
           <button class="icon" id="closeBtn" aria-label="Kapat">✕</button>
@@ -124,11 +131,11 @@
       </header>
       <div class="compare">
         <section>
-          <h4><span class="dot now"></span><span id="modalQueryLabel">Şu an</span></h4>
+          <h4><span class="dot now"></span><span id="modalQueryLabel">Şu an</span><span class="htf" id="modalQueryHtf"></span><span class="ctx-line" id="modalQueryCtx"></span></h4>
           <div id="modalQuery" class="chart-big"></div>
         </section>
         <section>
-          <h4><span class="dot past"></span><span id="modalPastLabel">Geçmiş</span></h4>
+          <h4><span class="dot past"></span><span id="modalPastLabel">Geçmiş</span><span class="htf" id="modalPastHtf"></span><span class="ctx-line" id="modalPastCtx"></span></h4>
           <div id="modalMatch" class="chart-big"></div>
         </section>
       </div>

@@ -45,6 +45,7 @@ def config_frame(df: pd.DataFrame, s: float, t: float) -> pd.DataFrame:
     pick = lambda col: np.where(out.side == "long", out[f"{col}_long"], out[f"{col}_short"])
     out["est"], out["real"], out["win"], out["bars"] = pick("est"), pick("real"), pick("win"), pick("bars")
     out["idx"] = df.idx
+    out["cost"] = cost
     return out
 
 
@@ -93,11 +94,14 @@ def main(period: str):
                 rows.append(row)
             table = pd.DataFrame(rows)
             print(table.to_string(index=False))
-            # Kalibrasyon: tahmini beklentiye göre beşe böl, gerçek ortalamaya bak.
+            # Kalibrasyon: tahmini beklentiye göre beşe böl, gerçek ortalamaya bak. Sıralama masrafsız
+            # tahminle yapılır: masraf karar anına göre değişip tahmine de gerçeğe de aynı eklendiği için
+            # masraflı sıralama, analoglar hiçbir şey bilmese de sahte bir korelasyon gösterir.
             for side in ("long", "short"):
-                q = pd.qcut(f[f"est_{side}"], 5, labels=False, duplicates="drop")
+                raw = f[f"est_{side}"] + f.cost
+                q = pd.qcut(raw, 5, labels=False, duplicates="drop")
                 cal = f.groupby(q).agg(tahmin=(f"est_{side}", "mean"), gercek=(f"real_{side}", "mean"))
-                rho = f[f"est_{side}"].rank().corr(f[f"real_{side}"].rank())   # Spearman
+                rho = raw.rank().corr((f[f"real_{side}"] + f.cost).rank())   # Spearman, masrafsız
                 print(f"  kalibrasyon {side:<5} (sıra korelasyonu {rho:+.3f}): " + "  ".join(
                     f"{a:+.2f}->{b:+.2f}" for a, b in zip(cal.tahmin, cal.gercek)))
             for th in (0.0, 0.2):
