@@ -58,19 +58,23 @@ def update(interval: str = "1h"):
 
 @app.get("/api/search")
 def search(interval: str = "1h", method: str = "dtw", now: int | None = None,
-           start: int | None = None, end: int | None = None, rank: str = "shape"):
+           start: int | None = None, end: int | None = None, rank: str = "shape", filter: str = "none"):
     """now: 'şu an' (unix saniye, boşsa son mum). start/end: kullanıcının seçtiği aralık.
-    rank: 'shape' şekle göre, 'context' şekil + bağlama göre sıralar."""
+    rank: 'shape' şekle göre, 'context' şekil + bağlama göre sıralar.
+    filter: 'none', 'cycle' (aynı döngü dönemi), 'cycle_trend' (döngü + üst zaman dilimi durumu aynı)."""
     if method not in ("dtw", "euclid"):
         raise HTTPException(400, "method 'dtw' ya da 'euclid' olmalı")
     if rank not in ("shape", "context"):
         raise HTTPException(400, "rank 'shape' ya da 'context' olmalı")
+    if filter not in ("none", "cycle", "cycle_trend"):
+        raise HTTPException(400, "filter 'none', 'cycle' ya da 'cycle_trend' olmalı")
     if (start is None) != (end is None):
         raise HTTPException(400, "Seçim için start ve end birlikte verilmeli")
     with lock:
         try:
             return json_response(get_engine(interval).find(
-                now, method == "dtw", (start, end) if start is not None else None, rank == "context"))
+                now, method == "dtw", (start, end) if start is not None else None, rank == "context",
+                cycle=filter != "none", same_trend=filter == "cycle_trend"))
         except ValueError as e:
             raise HTTPException(400, str(e))
 

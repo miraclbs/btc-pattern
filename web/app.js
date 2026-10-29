@@ -39,36 +39,43 @@ const kindText = (g) => ({ tepe: 'Tepeden', dip: 'Dipten', secim: 'Seçim' })[g.
 /** Benzerlik yüzdesine göre renk tonu: lo ve altı kırmızı, lo + span ve üstü yeşil. */
 const hueOf = (v, lo, span) => Math.round(30 + 115 * Math.max(0, Math.min(1, (v - lo) / span)));
 
-/** Bağlam (engine._context, yapının boyu cinsinden): [nereden geldi, üstteki likidite, alttaki likidite]. */
-function ctxText(c) {
-  if (!c || c.includes(null)) return '';
-  const side = (v, name) => (v >= 0 ? `${name} ${num(v)}×` : `${name} alınmış`);
-  return `önce ${c[0] < 0 ? '↓' : '↑'}${num(Math.abs(c[0]))}× · ${side(c[1], 'üstte')} · ${side(c[2], 'altta')}`;
+/** Hikâye (engine._context): yapı nereden gelmiş, üstte/altta alınmamış likidite var mı. */
+function storyText(c) {
+  if (!c || c.includes(null)) return 'Öncesi bilinmiyor';
+  const from = c[0] < -0.5 ? 'Düşüşten geldi' : c[0] > 0.5 ? 'Yükselişten geldi' : 'Yataydan geldi';
+  return `${from} · ${c[1] >= 0 ? 'Üstte likidite duruyor' : 'Üstteki likidite alınmış'}`
+    + ` · ${c[2] >= 0 ? 'Altta likidite duruyor' : 'Alttaki likidite alınmış'}`;
 }
-/** Üst zaman dilimi durumu (engine.htf_state): [ad, trend, son bacak]. Örn. "4S ↑ düzeltme". */
-function htfText([name, trend, leg]) {
-  if (!trend || !leg) return `${name} ?`;
-  const arrow = { yukarı: '↑', aşağı: '↓', yatay: '→' }[trend];
-  const phase = trend === 'yatay' ? (leg === 'yukarı' ? 'yükselen bacak' : 'düşen bacak')
-    : (trend === leg ? 'trend yönünde' : 'düzeltme');
-  return `${name} ${arrow} ${phase}`;
+/** Üst zaman dilimi (engine.htf_state: [ad, trend, son bacak]): "4S: düşüş trendi", "1G: yükseliş trendinde düzeltme". */
+function trendText([name, trend, leg]) {
+  if (!trend || !leg) return `${name}: bilinmiyor`;
+  if (trend === 'yatay') return `${name}: yatay`;
+  const word = trend === 'yukarı' ? 'yükseliş' : 'düşüş';
+  if (trend === leg) return `${name}: ${word} trendi`;
+  return `${name}: ${word} trendinde ${trend === 'yukarı' ? 'düzeltme' : 'tepki'}`;
 }
-function htfTitle([name, trend, leg]) {
-  if (!trend || !leg) return `${name}: yeterli geçmiş yok`;
-  const word = { yukarı: 'yükseliş', aşağı: 'düşüş', yatay: 'yatay' }[trend];
-  return `${name}: ${trend === 'yatay' ? 'trend yok (yatay)' : `${word} trendi`}, `
-    + `son dönüşten beri fiyat ${leg === 'yukarı' ? 'yükseliyor' : 'düşüyor'}`;
+const trendLine = (list) => (list || []).map(trendText).join(' · ');
+/** BTC döngüsündeki yer (engine._cycle_json: [halving'den geçen gün, dönem]): "Döngü: ayı dibi (halving +922. gün)". */
+const cycleText = (c) => (c ? `Döngü: ${c[1]} (halving +${c[0]}. gün)` : '');
+const FILTERS = ['none', 'cycle', 'cycle_trend'];
+// Sunucunun yanıt sürümü (engine.API_VERSION). Kod güncellenip sunucu yeniden başlatılmazsa eski yanıtta
+// yeni alanlar olmaz; o zaman anlaşılmaz bir hata yerine bu mesaj gösterilir.
+const API_VERSION = 3;
+const OUTDATED = 'Sunucu eski sürümle çalışıyor: baslat.bat penceresini kapatıp yeniden aç, sonra sayfayı yenile (Ctrl + F5).';
+
+/** Kartın seçili yapıya göre iki etiketi: Hikâye (bağlam %) ve Trend (üst zaman dilimleri). */
+function matchTags(r, g) {
+  const story = r.context >= 80 ? ['benzer', 'good'] : r.context >= 60 ? ['kısmen', 'mid'] : ['farklı', 'bad'];
+  const ref = g.htf || [];
+  const same = (r.htf || []).filter((x, i) => ref[i] && trendText(x) === trendText(ref[i])).length;
+  const trend = same && same === ref.length ? ['aynı', 'good'] : same ? ['kısmen', 'mid'] : ['farklı', 'bad'];
+  return `<span class="tag ${story[1]}" title="Bu olay: ${storyText(r.ctx)}&#10;Seninki: ${storyText(g.context)}">`
+    + `Hikâye: ${story[0]}</span>`
+    + `<span class="tag ${trend[1]}" title="Bu olay: ${trendLine(r.htf)}&#10;Seninki: ${trendLine(g.htf)}">`
+    + `Trend: ${trend[0]}</span>`;
 }
-/** Etiket kutucukları; ref verilirse (seçili yapının durumu) aynı olanlar vurgulanır. */
-function htfChips(list, ref, cls = '') {
-  return (list || []).map((x, i) => {
-    const same = ref && ref[i] && x[1] === ref[i][1] && x[2] === ref[i][2];
-    return `<span class="${cls}${same ? ' same' : ''}" title="${htfTitle(x)}">${htfText(x)}</span>`;
-  }).join('');
-}
-const CTX_HELP ='Önce: yapıdan önceki 2 kat uzunlukta fiyat ne kadar düşmüş (↓) ya da yükselmiş (↑). '
-  + 'Üstte / altta: o dönemin en yüksek / en düşük noktası yapının tepesinin / dibinin ne kadar ötesinde '
-  + '(alınmamış likidite); "alınmış": yapı o seviyeyi geçmiş. Hepsi yapının boyu cinsinden.';
+const STORY_HELP = 'Öncesi: yapıdan önce fiyat ne yapmış. Likidite: yapıdan önceki en yüksek / en düşük nokta '
+  + 'henüz alınmamış mı. 4S / 1G: 4 saatlik ve günlük trend (düzeltme / tepki: trende ters giden kısım).';
 /** n mumun kabaca ne kadar zaman ettiği: "~11 gün", "~18 saat". */
 function span(n) {
   const hours = (n * TF[state.tf].sec) / 3600;
@@ -81,7 +88,7 @@ function loadPrefs() {
 function savePrefs() {
   try {
     localStorage.setItem('btc-pattern', JSON.stringify({
-      tf: state.tf, mode: state.mode, method: state.method, rank: state.rank, after: state.after, count: state.count,
+      tf: state.tf, mode: state.mode, method: state.method, filter: state.filter, after: state.after, count: state.count,
       levels: state.levels,
       now: $('#nowInput').value,
     }));
@@ -93,8 +100,8 @@ const state = {
   tf: TF[prefs.tf] ? prefs.tf : '1h',
   mode: prefs.mode || 'live',
   method: prefs.method || 'dtw',
-  rank: prefs.rank === 'context' ? 'context' : 'shape',
-  after: AFTER_OPTIONS.includes(prefs.after) ? prefs.after : (prefs.after === false ? 0 : 3),
+  filter: FILTERS.includes(prefs.filter) ? prefs.filter : 'cycle_trend',   // hangi dönemlerden örnek gelsin
+  after:AFTER_OPTIONS.includes(prefs.after) ? prefs.after : (prefs.after === false ? 0 : 3),
   count: COUNT_OPTIONS.includes(prefs.count) ? prefs.count : 50,
   levels: prefs.levels !== false,   // karşılaştırmada üst zaman dilimi tepe/dipleri
   drawing: false,                   // karşılaştırmada tıklayınca yatay çizgi
@@ -241,8 +248,7 @@ function render({ keepView = false } = {}) {
   const d = state.data;
   $('#nowLabel').textContent = `${state.mode === 'live' ? 'Canlı' : 'Geçmiş tarih'} · ${TF[d.interval].name}`
     + ` · şu an ${when(d.now)}`;
-  $('#elapsed').textContent = `${num(d.elapsed)} sn · ${d.method === 'dtw' ? 'DTW' : 'Birebir'}`
-    + (d.rank === 'context' ? ' + bağlam' : '');
+  $('#elapsed').textContent = `${num(d.elapsed)} sn · ${d.method === 'dtw' ? 'DTW' : 'Birebir'}`;
   renderGroups();
   renderMain({ keepView });
   renderGrid();
@@ -316,13 +322,15 @@ function renderGrid() {
     return;
   }
   const results = shownResults();
-  $('#queryHtf').innerHTML = `<b>${g.kind === 'secim' ? 'Seçtiğin yapı' : 'Şu anki yapı'}:</b>${htfChips(g.htf, null, 'query')}`
-    + '<small>Kartlarda seninkiyle aynı olan durum yeşil</small>';
+  $('#queryHtf').innerHTML = `<b>${g.kind === 'secim' ? 'Seçtiğin yapı' : 'Şu anki yapı'}:</b> `
+    + `${cycleText(g.cycle)} · ${storyText(g.context)} · ${trendLine(g.htf)}`;
   $('#groupTitle').textContent = g.kind === 'secim'
     ? `Seçtiğin ${g.length} mumluk yapıya en benzer ${results.length} olay`
     : `${kindText(g)} başlayan ${g.length} mumluk yapıya en benzer ${results.length} olay`;
   if (!results.length) {
-    grid.innerHTML = '<div class="empty">Bu yapıdan önce karşılaştırılacak yeterli geçmiş yok.</div>';
+    grid.innerHTML = state.data.filter === 'none'
+      ? '<div class="empty">Bu yapıdan önce karşılaştırılacak yeterli geçmiş yok.</div>'
+      : '<div class="empty">Bu filtreyle en az %80 benzer örnek bulunamadı. Üstten "Aynı döngü" ya da "Tüm dönemler"i dene.</div>';
     return;
   }
   // 50 kartın grafiği birden çizilmesin: kart ekrana yaklaşınca çizilir.
@@ -344,14 +352,11 @@ function renderGrid() {
     if (i < 10) card.style.animationDelay = `${i * 25}ms`;
     else card.style.animation = 'none';     // uzun listede beliriş animasyonu sadece ilk satırlarda
     card.title = `Bu yapı, seçili yapının ${num(r.length / g.length)} katı sürede oluşmuş`;
-    const sub = daily() ? `${r.length} mum` : `${hour(r.start)} · ${r.length} mum`;
-    const ctx = ctxText(r.ctx);
+    const sub = `${daily() ? '' : `${hour(r.start)} · `}${r.length} mum${r.cycle ? ` · ${r.cycle[1]}` : ''}`;
     card.innerHTML = `<header><span class="rank">${r.rank}</span>`
       + `<div class="when"><b>${day(r.start)}</b><small>${sub}</small></div>`
-      + `<div class="scores"><span class="sim" style="--h:${hueOf(r.similarity, 85, 13)}" title="Şekil benzerliği">%${num(r.similarity)}</span>`
-      + `<small class="ctx" style="--h:${hueOf(r.context, 40, 50)}" title="${ctx ? `Bu olay: ${ctx}\n\n${CTX_HELP}` : CTX_HELP}">`
-      + `bağlam %${r.context}</small></div></header>`
-      + `<div class="htf">${htfChips(r.htf, g.htf)}</div><div class="mini"></div>`;
+      + `<span class="sim" style="--h:${hueOf(r.similarity, 85, 13)}" title="Şekil benzerliği">%${num(r.similarity)}</span></header>`
+      + `<div class="tags">${matchTags(r, g)}</div><div class="mini"></div>`;
     card.onclick = () => openModal(i);
     card.onkeydown = (e) => {
       if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.stopPropagation(); openModal(i); }
@@ -507,11 +512,10 @@ async function renderModal() {
       + ' daha ilerisi için grafiği sağa kaydır' : '');
   $('#modalQueryLabel').textContent = g.kind === 'secim' ? `Seçtiğin yapı · ${day(g.start)}` : 'Şu an';
   $('#modalPastLabel').textContent = `Geçmiş · ${day(r.start)}`;
-  $('#modalQueryHtf').innerHTML = htfChips(g.htf, null, 'query');
-  $('#modalPastHtf').innerHTML = htfChips(r.htf, g.htf);
-  $('#modalQueryCtx').textContent = ctxText(g.context);
-  $('#modalPastCtx').textContent = ctxText(r.ctx) && `${ctxText(r.ctx)} · bağlam uyumu %${r.context}`;
-  $('#modalQueryCtx').title = $('#modalPastCtx').title = CTX_HELP;
+  $('#modalPastTags').innerHTML = matchTags(r, g);
+  $('#modalQueryCtx').textContent = `${cycleText(g.cycle)} · ${storyText(g.context)} · ${trendLine(g.htf)}`;
+  $('#modalPastCtx').textContent = `${cycleText(r.cycle)} · ${storyText(r.ctx)} · ${trendLine(r.htf)}`;
+  $('#modalQueryCtx').title = $('#modalPastCtx').title = STORY_HELP;
 
   // Seçim "şu an"dan önce bitiyorsa, sonrasında ne olduğu da (soluk) gösterilir. Öncesi ana grafikteki
   // kadardır (seviyelere bakmak için sola kaydırılabilir); ilk görünüm yapının yarısı kadar öncesinden.
@@ -574,6 +578,7 @@ async function api(path, opts) {
 
 function renderStatus(st) {
   state.status = st;
+  if (st.version !== API_VERSION) toast(OUTDATED, 'error');
   $('#status').textContent = `${st.count.toLocaleString('tr-TR')} ${TF[st.interval].name} mum · ${short(st.last)} itibarıyla`;
 }
 
@@ -597,7 +602,8 @@ function toast(msg, kind = '') {
 
 async function runSearch({ keepView = false } = {}) {
   if (state.busy) return;
-  const params = new URLSearchParams({ interval: state.tf, method: state.method, rank: state.rank });
+  // Sıralama hep şekil + bağlam: hikâyesi de benzeyen örnekler öne gelir (tahmin farkı yok, okuması kolay).
+  const params = new URLSearchParams({ interval: state.tf, method: state.method, rank: 'context', filter: state.filter });
   if (state.mode === 'past') {
     const v = $('#nowInput').value;
     if (!v) { toast('Önce bir tarih seç.', 'error'); return; }
@@ -618,8 +624,14 @@ async function runSearch({ keepView = false } = {}) {
       }
     }
     setBusy(true, 'Aranıyor…');
-    state.data = await api(`/api/search?${params}`);
-    state.group = Math.min(state.group, Math.max(0, state.data.groups.length - 1));
+    const data = await api(`/api/search?${params}`);
+    if (data.version !== API_VERSION) {
+      $('#grid').innerHTML = `<div class="empty">${OUTDATED}</div>`;
+      toast(OUTDATED, 'error');
+      return;
+    }
+    state.data = data;
+    state.group =Math.min(state.group, Math.max(0, state.data.groups.length - 1));
     render({ keepView });
   } catch (e) {
     toast(`Arama başarısız: ${e.message}`, 'error');
@@ -698,20 +710,20 @@ function bind() {
       if (b.dataset.v === 'past') $('#nowInput').focus(); else runSearch();
     };
   });
+  document.querySelectorAll('#filterSeg button').forEach((b) => {
+    b.onclick = () => {
+      if (state.filter === b.dataset.v) return;
+      state.filter = b.dataset.v;
+      setSeg('#filterSeg', state.filter);
+      savePrefs();
+      if (state.data) runSearch({ keepView: true });
+    };
+  });
   document.querySelectorAll('#methodSeg button').forEach((b) => {
     b.onclick = () => {
       if (state.method === b.dataset.v) return;
       state.method = b.dataset.v;
       setSeg('#methodSeg', state.method);
-      savePrefs();
-      if (state.data) runSearch({ keepView: true });
-    };
-  });
-  document.querySelectorAll('#rankSeg button').forEach((b) => {
-    b.onclick = () => {
-      if (state.rank === b.dataset.v) return;
-      state.rank = b.dataset.v;
-      setSeg('#rankSeg', state.rank);
       savePrefs();
       if (state.data) runSearch({ keepView: true });
     };
@@ -755,7 +767,7 @@ async function init() {
   setSeg('#tfSeg', state.tf);
   $('#tfChip').textContent = `BTC/USDT · ${TF[state.tf].chip}`;
   setSeg('#methodSeg', state.method);
-  setSeg('#rankSeg', state.rank);
+  setSeg('#filterSeg', state.filter);
   $('#levelsBtn').classList.toggle('on', state.levels);
   setSeg('#afterSeg', String(state.after));
   setSeg('#countSeg', String(state.count));

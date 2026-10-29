@@ -33,9 +33,10 @@
         <button data-v="dtw" class="on" title="Yapının bölümleri farklı hızda oluşmuş olsa da eşleştirir">DTW</button>
         <button data-v="euclid" title="Mumları sırayla, birebir karşılaştırır">Birebir</button>
       </div>
-      <div class="seg" id="rankSeg" role="tablist" aria-label="Sıralama">
-        <button data-v="shape" class="on" title="Sadece yapının şekline göre sıralar">Şekil</button>
-        <button data-v="context" title="Şekle göre en iyi 200 olayı, yapının öncesi ve likiditesi de benzeyecek şekilde yeniden sıralar. Yürüyen testte tahmini iyileştirmedi; göze daha tutarlı örnekler göstermek için">Şekil + bağlam</button>
+      <div class="seg" id="filterSeg" role="tablist" aria-label="Hangi dönemlerden örnek gelsin">
+        <button data-v="none" title="Bütün yıllardan örnekler">Tüm dönemler</button>
+        <button data-v="cycle" title="Sadece BTC'nin 4 yıllık döngüsünde aynı döneme denk gelen örnekler (halving'den geçen gün ±120)">Aynı döngü</button>
+        <button data-v="cycle_trend" class="on" title="Aynı döngü dönemi ve 4S / 1G trendi de seninkiyle aynı olan örnekler">Döngü + trend</button>
       </div>
       <div class="seg-labeled" title="Eşleşmeden sonra ne kadarı gösterilsin (yapı uzunluğunun katı)">
         <span>Sonrası</span>
@@ -83,8 +84,10 @@
       <div class="results-head">
         <div>
           <h2 id="groupTitle">En benzer olaylar</h2>
-          <p class="sub" id="groupSub">Vurgulu alan eşleşen yapı, sağındaki kısım sonrasında olanlar. Karta tıklayınca büyük karşılaştırma açılır.</p>
-          <div class="htf htf-query" id="queryHtf"></div>
+          <p class="query-line" id="queryHtf"></p>
+          <p class="sub" id="groupSub"><b>Nasıl okunur:</b> sıra numarasına değil, <span class="tag good">Hikâye: benzer</span>
+            ve <span class="tag good">Trend: aynı</span> olan kartların çoğunluğu sonra ne yapmış ona bak. Tek bir kart şanstır.
+            Vurgulu alan eşleşen yapı, sağı sonrasında olanlar; karta tıklayınca büyük karşılaştırma açılır.</p>
         </div>
         <div class="seg-labeled" title="Kaç benzer olay gösterilsin">
           <span>Sonuç</span>
@@ -131,11 +134,11 @@
       </header>
       <div class="compare">
         <section>
-          <h4><span class="dot now"></span><span id="modalQueryLabel">Şu an</span><span class="htf" id="modalQueryHtf"></span><span class="ctx-line" id="modalQueryCtx"></span></h4>
+          <h4><span class="dot now"></span><span id="modalQueryLabel">Şu an</span><span class="ctx-line" id="modalQueryCtx"></span></h4>
           <div id="modalQuery" class="chart-big"></div>
         </section>
         <section>
-          <h4><span class="dot past"></span><span id="modalPastLabel">Geçmiş</span><span class="htf" id="modalPastHtf"></span><span class="ctx-line" id="modalPastCtx"></span></h4>
+          <h4><span class="dot past"></span><span id="modalPastLabel">Geçmiş</span><span class="tags" id="modalPastTags"></span><span class="ctx-line" id="modalPastCtx"></span></h4>
           <div id="modalMatch" class="chart-big"></div>
         </section>
       </div>

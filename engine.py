@@ -58,6 +58,26 @@ LEVEL_BAND = 0.5                    # yapının dışında, boyunun bu katı uza
 HTF = {"15m": [("4S", 4 * 3600), ("1G", 86400)], "1h": [("4S", 4 * 3600), ("1G", 86400)],
        "4h": [("1G", 86400), ("1H", 7 * 86400)], "1d": [("1H", 7 * 86400)]}
 WEEK_ORIGIN = pd.Timestamp("1970-01-05")    # haftalık mumlar Pazartesi başlar (Binance gibi)
+
+# BTC'nin 4 yıllık döngüsü: bir yapı halving'den kaç gün sonra oluştu. Son üç döngüde tepe halving'den
+# 526-548 gün, dip 889-924 gün sonra geldi. Bir sonraki halving (~Nisan 2028) olunca listeye eklenmeli.
+HALVINGS = np.array([int(pd.Timestamp(x).timestamp()) for x in
+                     ("2012-11-28", "2016-07-09", "2020-05-11", "2024-04-20")], np.int64)
+CYCLE_WINDOW = 120                  # "aynı döngü dönemi": halving'den geçen gün farkı en fazla bu kadar
+API_VERSION = 3                     # yanıt alanları değişince artırılır; web/app.js'teki API_VERSION ile aynı olmalı
+MIN_SIM = 80                        # bundan az benzer olaylar gösterilmez: filtre sıkıyken liste alakasızlarla
+                                    # dolmasın (filtresiz aramada 50. sonuç genelde %94, en kötü ~%76)
+CYCLE_PHASES = ((180, "halving sonrası"), (540, "boğa"), (880, "ayı"), (1100, "ayı dibi"), (10 ** 6, "halving öncesi"))
+
+
+def cycle_day(ts):
+    """Son halving'den geçen gün (ts: unix saniye; dizi de olabilir)."""
+    ts = np.asarray(ts, np.int64)
+    return (ts - HALVINGS[np.searchsorted(HALVINGS, ts, side="right") - 1]) / 86400
+
+
+def cycle_phase(day: float) -> str:
+    return next(name for limit, name in CYCLE_PHASES if day < limit)
 CHUNK = 512                         # adaylar bu büyüklükte paketler halinde çekirdeklere dağıtılır
 
 # Bağlam: yapının içine değil, öncesine ve likiditeye bakar (şekil benzerliğinin görmediği kısım).
@@ -65,7 +85,7 @@ CTX_PRE = 2                         # yapıdan önceki bu kat kadar mum inceleni
 POOL = 200                          # "şekil + bağlam" sıralamasında, şekle göre en iyi bu kadar olay yeniden sıralanır
 CTX_WEIGHT = 0.1                    # sıralama puanı = şekil mesafesi + CTX_WEIGHT x bağlam farkı
 # Yürüyen testte (analyze_rank.py, 15dk 2018-2023) hiçbir ağırlık 1 günlük tahmini şekle göre sıralamanın
-# üstüne çıkarmadı; arayüzde varsayılan "Şekil", bağlam göze yardımcı olarak duruyor.
+# üstüne çıkarmadı ama düşürmedi de; arayüz hep bu sıralamayı kullanır, çünkü hikâyesi benzeyen örnekler okunması kolay.
 
 
 @njit(cache=True)
@@ -291,6 +311,37 @@ class Engine:
                         None if p < 0 else ("yukarı" if kind[p] == "dip" else "aşağı")])
         return out
 
+    def _cycle_json(self, e: int) -> list:
+        """Yapı e. mumda bittiğinde döngüdeki yeri: [halving'den geçen gün, dönem adı]."""
+        day = float(cycle_day(self.t[e - 1] + self.step))
+        return [int(day), cycle_phase(day)]
+
+    def allow_fn(self, q_end: int, cycle: bool, same_trend: bool):
+        """Filtre (search'ün allow'u): adayın bittiği an, sorgunun bittiği anla aynı döngü döneminde mi
+        (halving'den geçen gün farkı <= CYCLE_WINDOW) ve üst zaman dilimi durumu aynı mı (arayüzdeki
+        "Trend: aynı" ile aynı kural: trend aynı, trend yatay değilse son bacak da aynı)."""
+        if not (cycle or same_trend):
+            return None
+        q_day = cycle_day(self.t[q_end - 1] + self.step)
+        q_htf = self.htf_state(q_end)
+
+        def allow(starts, lengths):
+            t_end = self.t[starts + lengths - 1] + self.step
+            ok = np.ones(len(t_end), bool)
+            if cycle:
+                ok &= np.abs(cycle_day(t_end) - q_day) <= CYCLE_WINDOW
+            if same_trend:
+                for (_, q_tr, q_leg), (_, closes, trend, confirmed, kind) in zip(q_htf, self.htf):
+                    if q_tr is None or q_leg is None:
+                        continue                                  # sorgunun durumu bilinmiyor
+                    k = np.searchsorted(closes, t_end, side="right") - 1
+                    ok &= (k >= 0) & (trend[np.maximum(k, 0)] == q_tr)
+                    if q_tr != "yatay":
+                        p = np.searchsorted(confirmed, t_end, side="right") - 1
+                        ok &= (p >= 0) & ((kind[np.maximum(p, 0)] == "dip") == (q_leg == "yukarı"))
+            return ok
+        return allow
+
     def level_lines(self, s: int, e: int) -> list:
         """[s, e) yapısı bittiğinde bilinen üst zaman dilimi tepe/dipleri (sonradan oluşanlar yok), yapının
         çevresindekiler: [fiyat, tür, oluştuğu an, o zamana kadar kırılmış mı]."""
@@ -311,7 +362,7 @@ class Engine:
         return out
 
     def status(self) -> dict:
-        return {"interval": self.interval, "count": len(self.t),
+        return {"interval": self.interval, "count": len(self.t), "version": API_VERSION,
                 "first": int(self.t[0]), "last": int(self.t[-1]) + self.step}
 
     def pivots(self, now: int) -> list[tuple[int, str]]:
@@ -364,13 +415,15 @@ class Engine:
         return out
 
     def search(self, q_start: int, q_end: int, use_dtw: bool, exact: bool = False,
-               end_limit: int | None = None):
+               end_limit: int | None = None, allow=None):
         """Sorgudan önce bitmiş adayları puanlar: (dist, start, length), elenenler hariç.
 
         exact=True: her aday denenir (matcher.search ile aynı, foot=0).
         Aksi halde iki aşamalı: seyrek ön tarama + en iyilerin komşuları.
         end_limit: adaylar en geç bu indekste bitmeli (simülasyonda, adayın "sonrası" da karar
         anından önce bitsin diye: end_limit = şu an - ufuk).
+        allow: (başlangıçlar, uzunluklar) -> bool dizisi; False olan adaylar elenir (filtre). Ön taramada
+        uygulanır ki komşuları denenecek en iyi adaylar filtreden geçenler arasından seçilsin.
         """
         L = q_end - q_start
         last_end = q_start if end_limit is None else min(q_start, end_limit)
@@ -393,6 +446,8 @@ class Engine:
             return np.empty(0), np.empty(0, np.int64), np.empty(0, np.int64)
         s, m = np.concatenate(starts), np.concatenate(lengths)
         d = self._score(s, m, q, q_rel, use_dtw)
+        if allow is not None:
+            d[~allow(s, m)] = np.inf
 
         if coarse:
             # En iyi ön tarama adaylarının atlanan komşularını da dene.
@@ -407,8 +462,11 @@ class Engine:
                 nm.append(np.full(len(nb), m[k]))
             if ns:
                 s2, m2 = np.concatenate(ns), np.concatenate(nm)
+                d2 = self._score(s2, m2, q, q_rel, use_dtw)
+                if allow is not None:
+                    d2[~allow(s2, m2)] = np.inf
                 s, m = np.concatenate([s, s2]), np.concatenate([m, m2])
-                d = np.concatenate([d, self._score(s2, m2, q, q_rel, use_dtw)])
+                d = np.concatenate([d, d2])
 
         keep = np.isfinite(d)
         return d[keep], s[keep], m[keep]
@@ -444,10 +502,11 @@ class Engine:
                             min_before=DETAIL_MIN_BEFORE)
 
     def find(self, now_ts: int | None, use_dtw: bool, sel: tuple[int, int] | None = None,
-             by_context: bool = False) -> dict:
+             by_context: bool = False, cycle: bool = False, same_trend: bool = False) -> dict:
         """'Şu an' için arama. sel=(başlangıç, bitiş) verilirse otomatik gruplar yerine sadece
         kullanıcının seçtiği [başlangıç, bitiş) aralığına benzeyen olaylar aranır.
-        by_context: şekle göre en iyi POOL olay, şekil + bağlam puanıyla yeniden sıralanır."""
+        by_context: şekle göre en iyi POOL olay, şekil + bağlam puanıyla yeniden sıralanır.
+        cycle / same_trend: sadece aynı döngü döneminde / aynı üst zaman dilimi durumunda biten olaylar."""
         t0 = time.perf_counter()
         now = len(self.t) if now_ts is None else int(np.searchsorted(self.t, now_ts))
         now = max(MAX_LEN * 3, min(now, len(self.t)))
@@ -461,8 +520,10 @@ class Engine:
         else:
             groups = [{**g, "end_idx": now} for g in self.groups(now, piv)]
         for g in groups:
-            d, s, m = self.search(g["start_idx"], g["end_idx"], use_dtw)
+            d, s, m = self.search(g["start_idx"], g["end_idx"], use_dtw,
+                                  allow=self.allow_fn(g["end_idx"], cycle, same_trend))
             pool = distinct_events(d, s, m, POOL)           # şekle göre sıralı
+            pool = pool[100 * (1 - d[pool] / 2) >= MIN_SIM]
             q_ctx = self.context([g["start_idx"]], [g["length"]])[0]
             ctx = self.context(s[pool], m[pool])
             dc = context_distance(q_ctx, ctx)
@@ -474,6 +535,7 @@ class Engine:
             ctx_sim = context_similarity(dc[order])
             g["levels"] = self.level_lines(g["start_idx"], g["end_idx"])
             g["htf"] = self.htf_state(g["end_idx"])
+            g["cycle"] = self._cycle_json(g["end_idx"])
             g["start"] = int(self.t[g.pop("start_idx")])
             g["end"] = int(self.t[g.pop("end_idx") - 1]) + self.step
             g["context"] = _ctx_json(q_ctx)
@@ -482,6 +544,7 @@ class Engine:
                              "context": round(float(ctx_sim[r])), "ctx": _ctx_json(ctx[order[r]]),
                              "levels": self.level_lines(int(s[k]), int(s[k] + m[k])),
                              "htf": self.htf_state(int(s[k] + m[k])),
+                             "cycle": self._cycle_json(int(s[k] + m[k])),
                              "bars": self._window(int(s[k]), int(m[k]), now, pre=0.5, max_bars=CARD_BARS)}
                             for r, k in enumerate(picks)]
         a = max(0, now - MAIN_BARS)
@@ -490,6 +553,8 @@ class Engine:
             "now": int(self.t[now - 1]) + self.step,
             "method": "dtw" if use_dtw else "euclid",
             "rank": "context" if by_context else "shape",
+            "version": API_VERSION,
+            "filter": "cycle_trend" if cycle and same_trend else "cycle" if cycle else "trend" if same_trend else "none",
             "level_tf": LEVEL_NAME[self.interval],
             "main": self._bars(a, now, 1, 0),
             "pivots": [[int(self.t[i]), kind, float(self.h[i] if kind == "tepe" else self.l[i])]

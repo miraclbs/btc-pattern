@@ -177,29 +177,27 @@ main { max-width: 1680px; margin: 0 auto; padding: 20px 24px 8px; display: grid;
 .when { display: flex; flex-direction: column; min-width: 0; }
 .when b { font-weight: 600; font-size: 13.5px; white-space: nowrap; }
 .when small { color: var(--faint); font-size: 11.5px; white-space: nowrap; }
-.scores { margin-left: auto; display: flex; flex-direction: column; align-items: flex-end; gap: 2px; }
 .sim {
-  font: 600 12.5px "JetBrains Mono", monospace;
+  margin-left: auto; font: 600 12.5px "JetBrains Mono", monospace;
   padding: 3px 8px; border-radius: 8px;
   color: hsl(var(--h) 85% 72%); background: hsl(var(--h) 70% 50% / .12);
   border: 1px solid hsl(var(--h) 70% 55% / .25);
 }
-.ctx { font: 500 11px "JetBrains Mono", monospace; color: hsl(var(--h) 70% 68%); white-space: nowrap; cursor: help; }
-.ctx-line { margin-left: auto; font: 500 11.5px "JetBrains Mono", monospace; color: var(--faint); cursor: help; text-align: right; }
+.ctx-line { margin-left: auto; font-size: 12px; font-weight: 500; color: var(--muted); cursor: help; text-align: right; }
 .mini { height: 150px; margin-top: 8px; }
 
-/* Üst zaman dilimi etiketleri: trend + faz (düzeltme / trend yönünde) */
-.htf { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; margin-top: 8px; }
-.htf span {
-  font: 500 11px "JetBrains Mono", monospace; padding: 2px 7px; border-radius: 6px; white-space: nowrap;
-  border: 1px solid var(--border-2); color: var(--faint); cursor: help;
+/* Kartın seçili yapıya göre iki etiketi: Hikâye ve Trend (benzer/aynı yeşil, kısmen sarı, farklı gri) */
+.tags { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+.tag {
+  font-size: 11.5px; font-weight: 600; padding: 2px 8px; border-radius: 6px; white-space: nowrap; cursor: help;
+  border: 1px solid var(--border-2); color: var(--faint);
 }
-.htf span.same { color: #86efac; border-color: rgba(134, 239, 172, .35); background: rgba(34, 197, 94, .08); }
-.htf span.query { color: #c7d2fe; border-color: rgba(129, 140, 248, .4); background: rgba(99, 102, 241, .1); }
-.htf-query { font-size: 12.5px; color: var(--muted); }
-.htf-query b { font-weight: 600; margin-right: 2px; }
-.htf-query small { color: var(--faint); font-size: 11.5px; margin-left: 4px; }
-.compare h4 .htf { margin-top: 0; }
+.tag.good { color: #86efac; border-color: rgba(134, 239, 172, .4); background: rgba(34, 197, 94, .1); }
+.tag.mid { color: #fcd34d; border-color: rgba(252, 211, 77, .35); background: rgba(250, 204, 21, .08); }
+.compare h4 .tags { margin-top: 0; }
+.query-line { margin: 6px 0 0; font-size: 13px; color: var(--text); }
+.query-line b { font-weight: 600; color: #c7d2fe; }
+#groupSub .tag { cursor: default; padding: 0 6px; }
 
 .skeleton { pointer-events: none; animation: none; }
 .skeleton .bar, .skeleton .block {
